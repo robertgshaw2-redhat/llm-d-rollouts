@@ -1,6 +1,6 @@
 # Background: why rollouts are hard for a KV-cache-aware router
 
-This page covers the pieces the four examples are built from. Read it first if llm-d's router,
+This page covers the pieces the five examples are built from. Read it first if llm-d's router,
 P/D disaggregation or DisaggregatedSet are new to you. Each example's README assumes this
 material and only covers what is specific to that example.
 
@@ -62,7 +62,7 @@ ways of knowing where prefixes live:
 
 | | how it knows | used in |
 |---|---|---|
-| **approximate** (`approx-prefix-cache-producer` + `prefix-cache-scorer`) | it remembers which pod it sent each prefix to | examples 03, 04 |
+| **approximate** (`approx-prefix-cache-producer` + `prefix-cache-scorer`) | it remembers which pod it sent each prefix to | examples 00, 03, 04 |
 | **precise** (`precise-prefix-cache-producer`) | every vLLM pod publishes **KV events** (block stored / block evicted) over ZMQ, and the EPP builds an index of exactly which blocks each pod holds. It tokenizes each request the same way vLLM does (`token-producer` → vLLM's `/v1/chat/completions/render`) so the block hashes match. | examples 01, 02 |
 
 Either way, the cache is **state**, and it lives in two places:
@@ -71,10 +71,15 @@ Either way, the cache is **state**, and it lives in two places:
 2. in the **router** (its knowledge of which server holds what).
 
 A rollout replaces one of them. Done naively, either kind of rollout throws that state away and
-every in-flight conversation pays to recompute. Examples 01 and 02 roll the router; 03 and 04
-roll the model servers.
+every in-flight conversation pays to recompute. Examples 00, 01 and 02 roll the router; 03 and
+04 roll the model servers.
 
 ## Problem 1: rolling the router loses its index
+
+With approximate routing the index is built from the EPP's own routing decisions, so a new EPP
+pod starts empty and has nothing to rebuild it from: every existing conversation is a miss until
+its next turn teaches the new pod where it went. [Example 00](../00-approx-epp-rollout/) measures
+this in the default setup and lists the limitations.
 
 With precise routing, the EPP's index is built from the live KV-event stream. A new EPP pod
 subscribes when it starts, so it only hears about blocks stored **after** it started. Every
@@ -244,7 +249,7 @@ within two health checks (4 s) and sends it no new streams. Streams it already h
 
 ## How the examples measure all this
 
-All four are judged on traffic, not on object status. An in-cluster probe pod (`loadgen.py`)
+All five are judged on traffic, not on object status. An in-cluster probe pod (`loadgen.py`)
 runs through every step:
 
 - **multi-turn chat sessions** (16 workers × 20 turns, a unique ~1500-word first message each so
@@ -258,7 +263,8 @@ runs through every step:
 failures, latency and prefix-cache hit rates. For the P/D examples it also prints, per session,
 which version served each turn.
 
-Each example also runs a **control**: examples 01 and 02 roll the EPP again without snapshots,
-and examples 03 and 04 run a second router with `affinity.mode: none` over the same pods with its own
-sessions. The difference between the two is the effect of the feature, measured on the same
-hardware at the same time.
+Each example also runs a **control**. Example 00 probes cold sessions with and without a
+rollout in between. Examples 01 and 02 roll the EPP again without snapshots. Examples 03 and 04
+run a second router with `affinity.mode: none` over the same pods, with its own sessions. The
+difference between the two is the effect of the feature, measured on the same hardware at the
+same time.

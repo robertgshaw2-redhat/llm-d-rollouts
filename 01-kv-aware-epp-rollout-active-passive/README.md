@@ -7,7 +7,8 @@ load each vLLM pod's cache state before it can take over.
 
 Background: [Problem 1](../docs/concepts.md#problem-1-rolling-the-router-loses-its-index) and
 [active-passive vs active-active](../docs/concepts.md#running-more-than-one-epp-active-passive-or-active-active)
-in the concepts doc. The same rollout with both EPPs routing at once is
+in the concepts doc. [Example 00](../00-approx-epp-rollout/) shows what goes wrong in the
+default setup, which this example fixes. The same rollout with both EPPs routing at once is
 [example 02](../02-kv-aware-epp-rollout-active-active/).
 
 - [Design](#design)

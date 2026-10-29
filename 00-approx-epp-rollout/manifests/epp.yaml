@@ -1,0 +1,150 @@
+# The router: one EPP replica, no leader election. This is the plain setup: the approximate
+# prefix-cache index lives in this one process.
+#
+# How a rollout goes (rollout.sh roll), with maxSurge 1 / maxUnavailable 0:
+#   1. A new pod starts with an empty prefix-cache index. Once the pool has synced it turns Ready,
+#      joins the headless Service, passes Envoy's health check and starts routing next to the
+#      old pod: requests round-robin over the two, each with its own index.
+#   2. After minReadySeconds, Kubernetes stops the old pod. On SIGTERM it reports NOT_SERVING;
+#      Envoy stops sending it new requests within 4 s. Requests it already routed keep their
+#      ext_proc stream on it until they end, which the grace period covers. Its index goes with it.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: apx-epp
+  labels:
+    app.kubernetes.io/part-of: apx
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: apx-epp
+  labels:
+    app.kubernetes.io/part-of: apx
+rules:
+- apiGroups: [""]
+  resources: [pods]
+  verbs: [get, watch, list]
+# The EPP watches inferencemodelrewrites whenever the CRD is installed; without the grant the
+# pool never initializes and the EPP reports NOT_SERVING.
+- apiGroups: [inference.networking.x-k8s.io, llm-d.ai]
+  resources: [inferenceobjectives, inferencemodelrewrites]
+  verbs: [get, watch, list]
+- apiGroups: [inference.networking.k8s.io]
+  resources: [inferencepools]
+  verbs: [get, watch, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: apx-epp
+  labels:
+    app.kubernetes.io/part-of: apx
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: apx-epp}
+subjects:
+- {kind: ServiceAccount, name: apx-epp}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apx-epp
+  labels:
+    app.kubernetes.io/name: apx-epp
+    app.kubernetes.io/part-of: apx
+spec:
+  replicas: 1
+  # A new pod routes next to the old one this long before Kubernetes stops the old one.
+  minReadySeconds: 30
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: apx-epp
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: apx-epp
+        app.kubernetes.io/part-of: apx
+    spec:
+      serviceAccountName: apx-epp
+      # Every request this pod routed holds an ext_proc stream on it until its response ends, and
+      # one still running when the grace period ends is cut mid-stream. Longer than any request
+      # loadgen.py sends (its long streams take ~2-3 min).
+      terminationGracePeriodSeconds: 600
+      containers:
+      - name: epp
+        # llm-d-router v1.0.0.
+        image: ghcr.io/llm-d/llm-d-router-endpoint-picker@sha256:024188e998f516879f68532016ca24fabca00afbdcc2af9a61b17634e197df2c
+        imagePullPolicy: IfNotPresent
+        args:
+        - --pool-name
+        - apx
+        - --config-file
+        - /config/epp.yaml
+        - --grpc-health-port
+        - "9003"
+        - --zap-encoder
+        - json
+        - --tracing=false
+        - --metrics-endpoint-auth=false
+        # After SIGTERM, keep answering ext_proc this long (Envoy needs <= 4 s to stop sending
+        # new requests), then wait for the open streams.
+        - --drain-timeout=15s
+        env:
+        # Also the pool namespace: --pool-namespace falls back to it.
+        - {name: NAMESPACE, valueFrom: {fieldRef: {fieldPath: metadata.namespace}}}
+        - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+        ports:
+        - {name: grpc, containerPort: 9002}
+        - {name: grpc-health, containerPort: 9003}
+        - {name: metrics, containerPort: 9090}
+        livenessProbe:
+          grpc: {port: 9003, service: liveness}
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          failureThreshold: 3
+        # Ready = pool synced, not draining. There is nothing else to wait for: the index can
+        # only be filled by routing.
+        readinessProbe:
+          grpc: {port: 9003, service: readiness}
+          periodSeconds: 2
+          failureThreshold: 3
+        resources:
+          requests: {cpu: "2", memory: 2Gi}
+          limits:   {memory: 8Gi}
+        volumeMounts:
+        - {name: config, mountPath: /config}
+      volumes:
+      - name: config
+        configMap:
+          name: apx-epp
+---
+# For the InferencePool's endpointPickerRef. Envoy does not use it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: apx-epp
+  labels:
+    app.kubernetes.io/part-of: apx
+spec:
+  selector:
+    app.kubernetes.io/name: apx-epp
+  ports:
+  - {name: grpc-ext-proc, port: 9002}
+---
+# What Envoy resolves: one A record per Ready EPP pod.
+apiVersion: v1
+kind: Service
+metadata:
+  name: apx-epp-headless
+  labels:
+    app.kubernetes.io/part-of: apx
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: apx-epp
+  ports:
+  - {name: grpc-ext-proc, port: 9002}

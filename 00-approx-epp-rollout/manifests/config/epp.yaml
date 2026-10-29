@@ -1,0 +1,28 @@
+# EPP plugin config: approximate prefix-cache routing, the llm-d default.
+#
+# approx-prefix-cache-producer keeps an in-memory index of which vLLM pod it sent each prompt
+# prefix to (64-token blocks, an LRU per pod). It tokenizes with the built-in `estimate` backend,
+# so it needs nothing from vLLM. prefix-cache-scorer prefers the pod with the longest match; the
+# queue scorer breaks ties and spreads load.
+#
+# The index is the only record of what is cached, and it lives in this process. It is built from
+# this process's own routing decisions, so a new EPP pod -- every pod a rollout creates -- starts
+# with an empty one, and there is nothing to load it from.
+apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- type: approx-prefix-cache-producer
+  name: prefix-cache-producer
+- type: prefix-cache-scorer
+  parameters:
+    prefixMatchInfoProducerName: prefix-cache-producer
+- type: queue-scorer
+- type: max-score-picker
+schedulingProfiles:
+- name: default
+  plugins:
+  - pluginRef: prefix-cache-scorer
+    weight: 3
+  - pluginRef: queue-scorer
+    weight: 1
+  - pluginRef: max-score-picker

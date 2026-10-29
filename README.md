@@ -1,12 +1,13 @@
 # llm-d rollouts
 
-Four runnable examples of rolling out an llm-d stack under live traffic, without dropping
+Five runnable examples of rolling out an llm-d stack under live traffic, without dropping
 requests and without throwing away the KV cache the router has been steering traffic toward.
 
 A KV-cache-aware router keeps state in two places: the **model servers** hold the KV blocks, and
 the **router** knows which server holds which prefix. A naive rollout of either one throws that
-state away, and every in-flight conversation pays to recompute its prefix. Each example shows
-the fix for one case, measures it against a control, and can be run end to end with one script.
+state away, and every in-flight conversation pays to recompute its prefix. Example 00 shows
+that problem in the default setup; each of the others shows the fix for one case, measures it
+against a control, and can be run end to end with one script.
 
 **New to llm-d's router, P/D or DisaggregatedSet? Start with [docs/concepts.md](docs/concepts.md).**
 
@@ -14,6 +15,7 @@ the fix for one case, measures it against a control, and can be run end to end w
 
 | | what rolls | what keeps the cache | needs |
 |---|---|---|---|
+| [**00** Basic EPP rollout, approximate routing](00-approx-epp-rollout/) | the **router**: one EPP with the default approximate prefix-cache index | nothing: the index lives in the EPP's memory and a new pod starts empty. This one shows the problem and explains why it can't be fixed in this setup | llm-d-router v1.0.0 |
 | [**01** KV-aware EPP rollout, active-passive](01-kv-aware-epp-rollout-active-passive/) | the **router**: a leader EPP and a hot standby (leader election) behind Envoy, one pod at a time | each new EPP loads every vLLM pod's **KV-cache snapshot** as a standby, so whichever pod takes over knows the old prefixes | vllm-project/vllm#57789 (vendored); llm-d-router v1.0.0 |
 | [**02** KV-aware EPP rollout, active-active](02-kv-aware-epp-rollout-active-active/) | the **router**: two EPPs both routing, sharing load through Redis | the same snapshots; no leader handover at all | the same |
 | [**03** P/D manual canary](03-pd-manual-canary-prefix-affinity/) | the **model servers**: a P/D stack, two DisaggregatedSets, scaled by hand (canary 1P1D, then shift) | the **rollout screener** keeps each prefill/decode pair in one revision, and **prefix affinity** keeps each session on one revision, moving at most once, old to new | llm-d/llm-d-router#3456 (image provided) |
@@ -33,6 +35,7 @@ NN-example/
 ```
 
 Suggested reading order: [concepts](docs/concepts.md) →
+[00](00-approx-epp-rollout/) (the problem, in the default setup) →
 [01](01-kv-aware-epp-rollout-active-passive/) (router state, the standard leader + standby setup) →
 [02](02-kv-aware-epp-rollout-active-active/) (the same with both routers active) →
 [03](03-pd-manual-canary-prefix-affinity/) (model-server state, step by step) →
@@ -43,7 +46,11 @@ Suggested reading order: [concepts](docs/concepts.md) →
 ```console
 $ export KUBECONFIG=~/.kube/<cluster>.yaml NS=<namespace>
 
-$ cd 01-kv-aware-epp-rollout-active-passive
+$ cd 00-approx-epp-rollout
+$ ./rollout.sh deploy && ./demo.sh            # ~15 min, 4 GPUs
+$ ./probe.sh stop && ./rollout.sh clean
+
+$ cd ../01-kv-aware-epp-rollout-active-passive
 $ ./rollout.sh deploy && ./demo.sh            # ~25 min, 4 GPUs
 $ ./probe.sh stop && ./rollout.sh clean
 
@@ -70,6 +77,7 @@ every drain.
 
 | example | measure | with the feature | control |
 |---|---|---|---|
+| 00 | idle sessions routed back to the pod holding their cache, approximate routing | **48/48 (100%)** with no rollout | 14/48 (29%) across one EPP rollout (chance: 25%) |
 | 01 | idle sessions routed back to the pod holding their cache after both EPPs were replaced | **48/48 (100%)** with snapshots | 15/48 (31%) without (chance: 25%) |
 | 02 | the same, active-active | **48/48 (100%)** with snapshots | 8/48 (17%) without (chance: 25%) |
 | 03 | follow-up turns that switched version during the canary | **0.3%**, never back to v0 | 42.7%, 15 sessions bounced back |
@@ -82,7 +90,7 @@ every drain.
   - the Gateway API Inference Extension CRDs (InferencePool);
   - for 03 and 04, LWS v0.10+ with the DisaggregatedSet CRD;
   - a `llm-d-hf-token` secret (key `HF_TOKEN`) in the namespace;
-  - GPUs: 4 for examples 01 and 02; 6 with RDMA (`rdma/ib`) for examples 03 and 04 at their peak.
+  - GPUs: 4 for examples 00, 01 and 02; 6 with RDMA (`rdma/ib`) for examples 03 and 04 at their peak.
 
 ### Running on your own cluster
 
@@ -91,8 +99,8 @@ The manifests were written for CoreWeave. Check these before running elsewhere:
 | setting | where | change it to |
 |---|---|---|
 | `KUBECONFIG`, `NS` | every script; defaults `~/.kube/kermit.yaml`, `robshaw-dev` | your cluster and namespace (just export them) |
-| `hostPath: /mnt/local/hf-cache`, `/mnt/local/jit-cache` | vLLM pods in all four | node-local disk on your nodes, or a PVC / `emptyDir` (slower cold start) |
-| toleration `is_gpu` | vLLM pods in all four | your GPU nodes' taints |
+| `hostPath: /mnt/local/hf-cache`, `/mnt/local/jit-cache` | vLLM pods in all five | node-local disk on your nodes, or a PVC / `emptyDir` (slower cold start) |
+| toleration `is_gpu` | vLLM pods in all five | your GPU nodes' taints |
 | `rdma/ib: 1`, `NCCL_IB_HCA=ibp` | P/D pods in 03, 04 | your RDMA device plugin's resource name and HCA prefix (NIXL needs RDMA between prefill and decode) |
 
 ## Unreleased pieces

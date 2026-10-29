@@ -1,0 +1,19 @@
+# Everything except the namespace: rollout.sh applies it with -n "$NS".
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - vllm.yaml
+  - epp.yaml
+  - proxy.yaml
+
+generatorOptions:
+  disableNameSuffixHash: true
+  labels:
+    app.kubernetes.io/part-of: apx
+
+configMapGenerator:
+  - name: apx-epp
+    files: [config/epp.yaml]
+  - name: apx-envoy
+    files: [config/envoy.yaml]
