@@ -1,4 +1,4 @@
-# 02: Zero-downtime manual canary of llm-d P/D, with prefix affinity across revisions
+# 03: Zero-downtime manual canary of llm-d P/D, with prefix affinity across revisions
 
 **What you'll learn:** how to replace one version of a prefill/decode-disaggregated stack with
 another, by hand and one step at a time, under live multi-turn chat traffic, so that:
@@ -8,7 +8,7 @@ another, by hand and one step at a time, under live multi-turn chat traffic, so 
   old to new.
 
 Background: [P/D, the rollout screener and prefix affinity in the concepts doc](../docs/concepts.md#pd-disaggregation).
-The hands-off version of the same rollout is [example 03](../03-pd-rolling-update-prefix-affinity/).
+The hands-off version of the same rollout is [example 04](../04-pd-rolling-update-prefix-affinity/).
 
 - [Design](#design)
 - [How to run it](#how-to-run-it)
@@ -110,7 +110,7 @@ plus a load scorer at weight 1), so a session also returns to the same prefill a
 
 ### Why not just `kubectl apply` a new template?
 
-You can. That is [example 03](../03-pd-rolling-update-prefix-affinity/), and the router config is
+You can. That is [example 04](../04-pd-rolling-update-prefix-affinity/), and the router config is
 identical. Two objects buy you control: hold a 1P1D canary for a day, compare it against v0 on
 real traffic, and roll back by deleting one object. The cost is that you drive every step.
 
@@ -135,7 +135,7 @@ for your cluster, and see
 
 ```console
 $ export KUBECONFIG=~/.kube/<cluster>.yaml NS=<namespace>
-$ cd 02-pd-manual-canary-prefix-affinity
+$ cd 03-pd-manual-canary-prefix-affinity
 $ ./demo.sh                    # all seven steps, ~25 min plus model loading
 $ ./probe.sh stop && ./rollout.sh clean
 ```

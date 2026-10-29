@@ -1,12 +1,13 @@
 # Background: why rollouts are hard for a KV-cache-aware router
 
-This page covers the pieces the three examples are built from. Read it first if llm-d's router,
+This page covers the pieces the four examples are built from. Read it first if llm-d's router,
 P/D disaggregation or DisaggregatedSet are new to you. Each example's README assumes this
 material and only covers what is specific to that example.
 
 - [How llm-d routes a request](#how-llm-d-routes-a-request)
 - [Prefix-cache routing: the state that makes a rollout expensive](#prefix-cache-routing-the-state-that-makes-a-rollout-expensive)
 - [Problem 1: rolling the router loses its index](#problem-1-rolling-the-router-loses-its-index)
+- [Running more than one EPP: active-passive or active-active](#running-more-than-one-epp-active-passive-or-active-active)
 - [P/D disaggregation](#pd-disaggregation)
 - [Problem 2: rolling the model servers splits sessions across versions](#problem-2-rolling-the-model-servers-splits-sessions-across-versions)
 - [The rollout screener](#the-rollout-screener)
@@ -51,7 +52,7 @@ you can read the whole path in one place.
 ## Prefix-cache routing: the state that makes a rollout expensive
 
 vLLM caches the KV tensors of every prompt prefix it has computed, in fixed-size blocks
-(64 tokens in example 1). A follow-up turn of a chat conversation repeats the whole conversation
+(64 tokens in examples 01 and 02). A follow-up turn of a chat conversation repeats the whole conversation
 so far. If it lands on the pod that served the previous turn, the prefix is a cache hit and only
 the new tokens are computed. If it lands anywhere else, the whole conversation is recomputed,
 which for a long conversation is most of the cost of the turn.
@@ -61,8 +62,8 @@ ways of knowing where prefixes live:
 
 | | how it knows | used in |
 |---|---|---|
-| **approximate** (`approx-prefix-cache-producer` + `prefix-cache-scorer`) | it remembers which pod it sent each prefix to | examples 2, 3 |
-| **precise** (`precise-prefix-cache-producer`) | every vLLM pod publishes **KV events** (block stored / block evicted) over ZMQ, and the EPP builds an index of exactly which blocks each pod holds. It tokenizes each request the same way vLLM does (`token-producer` → vLLM's `/v1/chat/completions/render`) so the block hashes match. | example 1 |
+| **approximate** (`approx-prefix-cache-producer` + `prefix-cache-scorer`) | it remembers which pod it sent each prefix to | examples 03, 04 |
+| **precise** (`precise-prefix-cache-producer`) | every vLLM pod publishes **KV events** (block stored / block evicted) over ZMQ, and the EPP builds an index of exactly which blocks each pod holds. It tokenizes each request the same way vLLM does (`token-producer` → vLLM's `/v1/chat/completions/render`) so the block hashes match. | examples 01, 02 |
 
 Either way, the cache is **state**, and it lives in two places:
 
@@ -70,7 +71,8 @@ Either way, the cache is **state**, and it lives in two places:
 2. in the **router** (its knowledge of which server holds what).
 
 A rollout replaces one of them. Done naively, either kind of rollout throws that state away and
-every in-flight conversation pays to recompute. The examples tackle one problem each.
+every in-flight conversation pays to recompute. Examples 01 and 02 roll the router; 03 and 04
+roll the model servers.
 
 ## Problem 1: rolling the router loses its index
 
@@ -79,7 +81,7 @@ subscribes when it starts, so it only hears about blocks stored **after** it sta
 prefix cached before that (an idle conversation waiting for its user's next message, a shared
 system prompt) is invisible to it, and gets routed by load to a pod that has to recompute it.
 
-The fix in [example 1](../01-kv-aware-epp-rollout/) is **KV-event snapshots**
+The fix in [examples 01](../01-kv-aware-epp-rollout-active-passive/) and [02](../02-kv-aware-epp-rollout-active-active/) is **KV-event snapshots**
 (vllm-project/vllm#57789 + llm-d/llm-d-router#2946):
 
 ```
@@ -94,11 +96,28 @@ The fix in [example 1](../01-kv-aware-epp-rollout/) is **KV-event snapshots**
 The new EPP loads each pod's current state before it reports Ready, so from its first request it
 knows everything the old EPPs knew.
 
-Example 1 also runs the EPP **active-active**: two replicas with no leader election, both
-healthy in Envoy, both routing. Each builds the same index from the same events. The one thing
-they would disagree on is load (each only sees its own in-flight requests), so they share their
-per-pod in-flight counts through Redis (`redis-syncer`). With two active replicas, a rolling
-update of the EPP Deployment always leaves at least one fully warmed router serving.
+## Running more than one EPP: active-passive or active-active
+
+One EPP replica is a single point of failure, and rolling it means a moment with no router. Both
+EPP examples run two replicas, in the two ways llm-d supports:
+
+**Active-passive** ([example 01](../01-kv-aware-epp-rollout-active-passive/)):
+`--ha-enable-leader-election`. The replicas compete for a Kubernetes Lease. Both sync the pool,
+follow the KV events and keep the same index (a *hot standby*), but only the leader passes the
+ext_proc health check, so Envoy sends every request to it. Queueing and in-flight load live in
+one process. When the leader shuts down it releases the lease, a standby takes it within a retry
+period (2 s), and Envoy moves to it at its next health check. For the second or two in between,
+Envoy has no healthy EPP and, with `healthy_panic_threshold: 1`, spreads requests over all of
+them; the standbys route those too.
+
+**Active-active** ([example 02](../02-kv-aware-epp-rollout-active-active/)): no leader election.
+Both replicas pass the health check and Envoy round-robins between them. Each builds the same
+index from the same events. The one thing they would disagree on is load (each sees only its
+own in-flight requests), so they share per-pod in-flight counts through Redis (`redis-syncer`).
+A rollout never hands over: a new pod joins the rotation, then an old one leaves it.
+
+Either way, snapshots are what make the new pod warm. The comparison table is in
+[example 02's README](../02-kv-aware-epp-rollout-active-active/#01-or-02).
 
 ## P/D disaggregation
 
@@ -201,13 +220,13 @@ Two limits to know:
 - It works for chat completions and Anthropic messages, which have a "first user message".
   `/v1/completions` and Responses requests keep the random draw.
 - The split is per session, not per request, so with few, unequal sessions it is lumpy. In
-  example 2, 50/50 capacity served 40/60.
+  example 03, 50/50 capacity served 40/60.
 
 ## Draining without dropping requests
 
 Every pod that a rollout removes is doing work. The examples use the same chain to finish it.
 
-**Model-server pods** (examples 2, 3):
+**Model-server pods** (examples 03, 04):
 
 | setting | why |
 |---|---|
@@ -218,14 +237,14 @@ Every pod that a rollout removes is doing work. The examples use the same chain 
 | `terminationGracePeriodSeconds: 150` | more than preStop + shutdown timeout |
 | `kv_load_failure_policy: fail` | a KV transfer lost to a drain fails the request loudly instead of silently recomputing, so the test can see it |
 
-**EPP pods** (example 1): `maxSurge: 1, maxUnavailable: 0, minReadySeconds: 30`. On SIGTERM the
-EPP reports `NOT_SERVING`, and Envoy marks it unhealthy within two health checks (4 s) and sends
-it no new streams. Streams it already holds run to the end of their response, and
+**EPP pods** (examples 01, 02): `maxSurge: 1, maxUnavailable: 0, minReadySeconds: 30`. On SIGTERM
+the EPP reports `NOT_SERVING` (and, as leader, releases the lease), and Envoy marks it unhealthy
+within two health checks (4 s) and sends it no new streams. Streams it already holds run to the end of their response, and
 `terminationGracePeriodSeconds: 600` covers the longest.
 
 ## How the examples measure all this
 
-All three are judged on traffic, not on object status. An in-cluster probe pod (`loadgen.py`)
+All four are judged on traffic, not on object status. An in-cluster probe pod (`loadgen.py`)
 runs through every step:
 
 - **multi-turn chat sessions** (16 workers × 20 turns, a unique ~1500-word first message each so
@@ -239,7 +258,7 @@ runs through every step:
 failures, latency and prefix-cache hit rates. For the P/D examples it also prints, per session,
 which version served each turn.
 
-Each example also runs a **control**: example 1 rolls the EPP again without snapshots, and
-examples 2 and 3 run a second router with `affinity.mode: none` over the same pods with its own
+Each example also runs a **control**: examples 01 and 02 roll the EPP again without snapshots,
+and examples 03 and 04 run a second router with `affinity.mode: none` over the same pods with its own
 sessions. The difference between the two is the effect of the feature, measured on the same
 hardware at the same time.

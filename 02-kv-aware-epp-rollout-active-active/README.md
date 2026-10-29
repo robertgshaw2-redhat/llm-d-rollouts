@@ -1,10 +1,25 @@
-# 01: KV-aware rollout of an active-active EPP
+# 02: KV-aware rollout of an active-active EPP
 
-**What you'll learn:** how to roll out the llm-d router itself (the EPP) under live traffic
-without dropping requests *and* without forgetting which vLLM pod holds which prefix. The trick
-is KV-event snapshots: a new EPP pod loads each vLLM pod's cache state before it takes traffic.
+**What you'll learn:** the second way to run and roll the llm-d router (the EPP). In
+[example 01](../01-kv-aware-epp-rollout-active-passive/) one EPP leads and a hot standby waits.
+Here both EPPs route at once, sharing their in-flight load through Redis, so a rollout never
+hands over: there is always a warm router serving. As in 01, KV-event snapshots let each new EPP
+pod load every vLLM pod's cache state before it takes traffic.
 
 Background: [Problem 1 in the concepts doc](../docs/concepts.md#problem-1-rolling-the-router-loses-its-index).
+This README stands alone, so it repeats 01's material on snapshots.
+
+### 01 or 02?
+
+| | 01 active-passive | 02 active-active |
+|---|---|---|
+| who routes | the lease holder; the standby keeps a warm index | both replicas, round-robin from Envoy |
+| extra parts | a Lease (leader election) | Redis + `redis-syncer` for cross-replica in-flight load |
+| flow control, in-flight counts | in one process, exact | per replica, summed through Redis every 200 ms (stale by up to that) |
+| during a rollout | one or two leader handovers; for ~2 s Envoy spreads requests over the standbys | no handover; a new pod joins the rotation, an old one leaves it |
+| leader crash | the standby takes over: within seconds through Envoy's panic routing, formally after the lease expires (15 s) | the other replica keeps routing; only the crashed pod's in-flight requests fail |
+| scales routing throughput | no, one router routes | yes, add replicas |
+| pick it when | you want one source of truth for queueing and load (the simpler default) | one EPP can't keep up, or you want no handover at all |
 
 - [Design](#design)
 - [How to run it](#how-to-run-it)
@@ -145,7 +160,7 @@ see [Running on your own cluster](../README.md#running-on-your-own-cluster).
 
 ```console
 $ export KUBECONFIG=~/.kube/<cluster>.yaml NS=<namespace>
-$ cd 01-kv-aware-epp-rollout
+$ cd 02-kv-aware-epp-rollout-active-active
 $ ./rollout.sh deploy          # vLLM x4, Redis, 2 EPPs, Envoy; ~3 min with weights cached on the nodes
 $ ./demo.sh                    # ~20 min: warm, roll with snapshots, roll without, restore
 $ ./probe.sh stop && ./rollout.sh clean

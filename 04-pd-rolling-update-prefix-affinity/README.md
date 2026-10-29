@@ -1,4 +1,4 @@
-# 03: Zero-downtime rolling update of llm-d P/D, with prefix affinity across revisions
+# 04: Zero-downtime rolling update of llm-d P/D, with prefix affinity across revisions
 
 **What you'll learn:** the hands-off version of a P/D rollout. You have one DisaggregatedSet and
 run one `kubectl apply` of the new pod template, and the controller rolls both roles by itself
@@ -6,7 +6,7 @@ under live multi-turn chat traffic. Meanwhile the router keeps every session on 
 that holds its KV cache until the roll moves it to the new revision, once.
 
 Background: [P/D, the rollout screener and prefix affinity in the concepts doc](../docs/concepts.md#pd-disaggregation).
-The step-by-step version of the same rollout is [example 02](../02-pd-manual-canary-prefix-affinity/).
+The step-by-step version of the same rollout is [example 03](../03-pd-manual-canary-prefix-affinity/).
 
 - [Design](#design)
 - [How to run it](#how-to-run-it)
@@ -29,7 +29,7 @@ The peak is 6 GPUs: 4, plus one surge group per role.
 
 ### The stack
 
-The same as [example 02](../02-pd-manual-canary-prefix-affinity/#the-stack): one Envoy, one EPP
+The same as [example 03](../03-pd-manual-canary-prefix-affinity/#the-stack): one Envoy, one EPP
 with the rollout screener, prefill and decode pods with the routing sidecar and NIXL. The only
 differences are that there is one DisaggregatedSet instead of two and the screener's scope is
 the set's name.
@@ -87,19 +87,19 @@ These are the main steps from the run below, as `rollout.sh update` printed them
 - With prefix affinity, the draw is a hash of the conversation up to its first user message.
   Each step moves the boundary between the two revisions toward the old one, and only the
   sessions it passes move, to the new revision, once. See the
-  [boundary diagram](../02-pd-manual-canary-prefix-affinity/#the-stack) in example 02.
+  [boundary diagram](../03-pd-manual-canary-prefix-affinity/#the-stack) in example 03.
 
 **Within a revision**, both profiles score with the approximate prefix-cache scorer, so a session
 also returns to the same prefill and decode pods.
 
 **Draining** is covered in
 [the concepts doc](../docs/concepts.md#draining-without-dropping-requests). It matters more here
-than in 02: the controller deletes old pods as soon as their replacements are Ready, whether or
+than in 03: the controller deletes old pods as soon as their replacements are Ready, whether or
 not they are mid-generation.
 
-### 02 or 03?
+### 03 or 04?
 
-| | 02 manual canary | 03 rolling update |
+| | 03 manual canary | 04 rolling update |
 |---|---|---|
 | objects | one DisaggregatedSet per version | one DisaggregatedSet |
 | who drives | you, one `scale` at a time | the controller, after one `apply` |
@@ -109,13 +109,13 @@ not they are mid-generation.
 
 ### Images
 
-The same as example 02. The EPP is `ghcr.io/robertgshaw2-redhat/llm-d-router-endpoint-picker:cb-v1.0.0-68c5e10`
+The same as example 03. The EPP is `ghcr.io/robertgshaw2-redhat/llm-d-router-endpoint-picker:cb-v1.0.0-68c5e10`
 (llm-d-router v1.0.0 plus #3456, public, by digest); see
 [the top-level README](../README.md#unreleased-pieces).
 
 ## How to run it
 
-**Needs:** the same as example 02: `kubectl`, `jq` and `python3` locally. On the cluster: LWS
+**Needs:** the same as example 03: `kubectl`, `jq` and `python3` locally. On the cluster: LWS
 v0.10+ with the DisaggregatedSet CRD, the InferencePool CRDs, a `llm-d-hf-token` secret, and 6
 free GPUs with `rdma/ib`. Set `KUBECONFIG` and `NS` (defaults: `~/.kube/kermit.yaml`,
 `robshaw-dev`), and see [Running on your own cluster](../README.md#running-on-your-own-cluster).
@@ -124,7 +124,7 @@ free GPUs with `rdma/ib`. Set `KUBECONFIG` and `NS` (defaults: `~/.kube/kermit.y
 
 ```console
 $ export KUBECONFIG=~/.kube/<cluster>.yaml NS=<namespace>
-$ cd 03-pd-rolling-update-prefix-affinity
+$ cd 04-pd-rolling-update-prefix-affinity
 $ ./demo.sh                    # ~15 min plus model loading
 $ ./probe.sh stop && ./rollout.sh clean
 ```

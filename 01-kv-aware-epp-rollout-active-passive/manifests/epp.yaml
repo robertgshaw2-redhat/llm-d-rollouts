@@ -1,0 +1,185 @@
+# The router: two EPP replicas with leader election, a leader and a hot standby. Both sync the
+# pool, subscribe to every vLLM pod's KV events and keep the same KV-cache index; only the leader
+# passes the ext_proc health check Envoy (proxy.yaml) uses, so only the leader routes. Flow
+# control and in-flight load live in one process, with nothing to share between replicas.
+#
+# How a rollout goes (rollout.sh roll), one pod at a time:
+#   1. A new pod starts as a standby. It syncs the pool, discovers the vLLM pods, and loads each
+#      one's KV-cache snapshot (tens of ms per pod), then follows the live events.
+#   2. It turns Ready (initialDelaySeconds below, after the snapshots) and joins the headless
+#      Service. Envoy health-checks it: NOT_SERVING, since it is not the leader.
+#   3. After minReadySeconds, Kubernetes stops one old pod. If that is a standby, nothing happens
+#      to traffic. If it is the leader, on SIGTERM it releases the lease and reports NOT_SERVING;
+#      a standby takes the lease within one retry period (2 s) and passes Envoy's next check. In
+#      between, Envoy has no healthy EPP and spreads requests over all of them (panic), and the
+#      standbys route them. Requests the old leader already routed keep their ext_proc stream on
+#      it until they end, which the grace period covers.
+#   4. Repeat for the second pod. Kubernetes picks which old pod goes, so a rollout has one or
+#      two handovers.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kvap-epp
+  labels:
+    app.kubernetes.io/part-of: kvap
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kvap-epp
+  labels:
+    app.kubernetes.io/part-of: kvap
+rules:
+- apiGroups: [""]
+  resources: [pods]
+  verbs: [get, watch, list]
+# The EPP watches inferencemodelrewrites whenever the CRD is installed; without the grant the
+# pool never initializes and the EPP reports NOT_SERVING.
+- apiGroups: [inference.networking.x-k8s.io, llm-d.ai]
+  resources: [inferenceobjectives, inferencemodelrewrites]
+  verbs: [get, watch, list]
+- apiGroups: [inference.networking.k8s.io]
+  resources: [inferencepools]
+  verbs: [get, watch, list]
+# Leader election: the lease, epp-<namespace>-<pool>.llm-d.ai, and its leader events.
+- apiGroups: [coordination.k8s.io]
+  resources: [leases]
+  verbs: [get, list, watch, create, update, patch, delete]
+- apiGroups: [""]
+  resources: [events]
+  verbs: [create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kvap-epp
+  labels:
+    app.kubernetes.io/part-of: kvap
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: kvap-epp}
+subjects:
+- {kind: ServiceAccount, name: kvap-epp}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kvap-epp
+  labels:
+    app.kubernetes.io/name: kvap-epp
+    app.kubernetes.io/part-of: kvap
+spec:
+  replicas: 2
+  # A new pod runs as a warm standby this long before Kubernetes stops an old one, so it is ready
+  # to take the lease.
+  minReadySeconds: 30
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kvap-epp
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kvap-epp
+        app.kubernetes.io/part-of: kvap
+    spec:
+      serviceAccountName: kvap-epp
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: kvap-epp
+              topologyKey: kubernetes.io/hostname
+      # Every request this pod routed holds an ext_proc stream on it until its response ends, and
+      # one still running when the grace period ends is cut mid-stream. Longer than any request
+      # loadgen.py sends (its long streams take ~2-3 min).
+      terminationGracePeriodSeconds: 600
+      containers:
+      - name: epp
+        # llm-d-router v1.0.0: precise prefix-cache routing, KV-event snapshot loading (#2946),
+        # leader election with a populated standby (haPopulateNonLeaderDatastore, on by default).
+        image: ghcr.io/llm-d/llm-d-router-endpoint-picker@sha256:024188e998f516879f68532016ca24fabca00afbdcc2af9a61b17634e197df2c
+        imagePullPolicy: IfNotPresent
+        args:
+        - --pool-name
+        - kvap
+        - --config-file
+        - /config/epp.yaml
+        - --grpc-health-port
+        - "9003"
+        - --zap-encoder
+        - json
+        - --tracing=false
+        - --metrics-endpoint-auth=false
+        - --allow-experimental-plugins
+        # The lease is epp-<namespace>-kvap.llm-d.ai. Default timings (15 s lease, 10 s renew
+        # deadline, 2 s retry): a leader that shuts down releases the lease at once and a standby
+        # takes it within 2 s; a leader that crashes is replaced after up to 15 s.
+        - --ha-enable-leader-election
+        # After SIGTERM, keep answering ext_proc this long (Envoy needs <= 4 s to stop sending
+        # new requests), then wait for the open streams.
+        - --drain-timeout=15s
+        env:
+        # Also the pool namespace: --pool-namespace falls back to it.
+        - {name: NAMESPACE, valueFrom: {fieldRef: {fieldPath: metadata.namespace}}}
+        - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+        ports:
+        - {name: grpc, containerPort: 9002}
+        - {name: grpc-health, containerPort: 9003}
+        - {name: metrics, containerPort: 9090}
+        livenessProbe:
+          grpc: {port: 9003, service: liveness}
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          failureThreshold: 3
+        # Pod readiness uses the always-passing liveness service, so the standby is Ready too and
+        # the rollout can complete. (The readiness service passes only on the leader: a new pod
+        # would never turn Ready, and the rollout would wait forever.) Which pod routes is
+        # decided by Envoy's ext_proc health check, not by pod readiness. The initial delay keeps
+        # a new pod out of the headless Service until it has loaded the vLLM snapshots.
+        readinessProbe:
+          grpc: {port: 9003, service: liveness}
+          initialDelaySeconds: 10
+          periodSeconds: 2
+          failureThreshold: 3
+        resources:
+          requests: {cpu: "2", memory: 2Gi}
+          limits:   {memory: 8Gi}
+        volumeMounts:
+        - {name: config, mountPath: /config}
+      volumes:
+      - name: config
+        configMap:
+          name: kvap-epp
+---
+# For the InferencePool's endpointPickerRef. Envoy does not use it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kvap-epp
+  labels:
+    app.kubernetes.io/part-of: kvap
+spec:
+  selector:
+    app.kubernetes.io/name: kvap-epp
+  ports:
+  - {name: grpc-ext-proc, port: 9002}
+---
+# What Envoy resolves: one A record per Ready EPP pod, leader and standbys alike.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kvap-epp-headless
+  labels:
+    app.kubernetes.io/part-of: kvap
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: kvap-epp
+  ports:
+  - {name: grpc-ext-proc, port: 9002}
