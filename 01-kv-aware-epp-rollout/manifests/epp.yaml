@@ -1,0 +1,169 @@
+# The router: two EPP replicas, both active (no leader election), sharing in-flight load through
+# Redis (redis.yaml). Envoy (proxy.yaml) health-checks every EPP pod and spreads requests over
+# the healthy ones, so both route at all times.
+#
+# How a rollout goes (rollout.sh roll), one pod at a time:
+#   1. A new pod starts. It syncs the pool, discovers the vLLM pods, and loads each one's KV-cache
+#      snapshot (tens of ms per pod). It is not Ready, so it is not in the headless Service and
+#      Envoy does not know it exists.
+#   2. It turns Ready (initialDelaySeconds below, after the snapshots), joins the headless
+#      Service, passes Envoy's health check and starts routing next to the two old pods.
+#   3. After minReadySeconds, Kubernetes stops one old pod. On SIGTERM it reports NOT_SERVING;
+#      Envoy marks it unhealthy within 4 s and sends it no new requests. Requests it already
+#      routed keep their ext_proc stream on it until they end, which the grace period covers.
+#   4. Repeat for the second pod.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kvepp-epp
+  labels:
+    app.kubernetes.io/part-of: kvepp
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kvepp-epp
+  labels:
+    app.kubernetes.io/part-of: kvepp
+rules:
+- apiGroups: [""]
+  resources: [pods]
+  verbs: [get, watch, list]
+# The EPP watches inferencemodelrewrites whenever the CRD is installed; without the grant the
+# pool never initializes and the EPP reports NOT_SERVING.
+- apiGroups: [inference.networking.x-k8s.io, llm-d.ai]
+  resources: [inferenceobjectives, inferencemodelrewrites]
+  verbs: [get, watch, list]
+- apiGroups: [inference.networking.k8s.io]
+  resources: [inferencepools]
+  verbs: [get, watch, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kvepp-epp
+  labels:
+    app.kubernetes.io/part-of: kvepp
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: kvepp-epp}
+subjects:
+- {kind: ServiceAccount, name: kvepp-epp}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kvepp-epp
+  labels:
+    app.kubernetes.io/name: kvepp-epp
+    app.kubernetes.io/part-of: kvepp
+spec:
+  replicas: 2
+  # A new pod routes next to the old ones this long before Kubernetes stops an old one.
+  minReadySeconds: 30
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kvepp-epp
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kvepp-epp
+        app.kubernetes.io/part-of: kvepp
+    spec:
+      serviceAccountName: kvepp-epp
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: kvepp-epp
+              topologyKey: kubernetes.io/hostname
+      # Every request this pod routed holds an ext_proc stream on it until its response ends, and
+      # one still running when the grace period ends is cut mid-stream. Longer than any request
+      # loadgen.py sends (its long streams take ~2-3 min).
+      terminationGracePeriodSeconds: 600
+      containers:
+      - name: epp
+        # llm-d-router v1.0.0: precise prefix-cache routing, KV-event snapshot loading (#2946),
+        # redis-syncer.
+        image: ghcr.io/llm-d/llm-d-router-endpoint-picker@sha256:024188e998f516879f68532016ca24fabca00afbdcc2af9a61b17634e197df2c
+        imagePullPolicy: IfNotPresent
+        args:
+        - --pool-name
+        - kvepp
+        - --config-file
+        - /config/epp.yaml
+        - --grpc-health-port
+        - "9003"
+        - --zap-encoder
+        - json
+        - --tracing=false
+        - --metrics-endpoint-auth=false
+        # redis-syncer is Alpha.
+        - --allow-experimental-plugins
+        # No --ha-enable-leader-election: both replicas route.
+        # After SIGTERM, keep answering ext_proc this long (Envoy needs <= 4 s to stop sending
+        # new requests), then wait for the open streams.
+        - --drain-timeout=15s
+        env:
+        # Also the pool namespace: --pool-namespace falls back to it.
+        - {name: NAMESPACE, valueFrom: {fieldRef: {fieldPath: metadata.namespace}}}
+        - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+        ports:
+        - {name: grpc, containerPort: 9002}
+        - {name: grpc-health, containerPort: 9003}
+        - {name: metrics, containerPort: 9090}
+        livenessProbe:
+          grpc: {port: 9003, service: liveness}
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          failureThreshold: 3
+        # Ready = pool synced, not draining. The initial delay keeps a new pod out of the
+        # headless Service (and so out of Envoy) until it has loaded the vLLM snapshots, which
+        # takes well under a second once the pods are discovered.
+        readinessProbe:
+          grpc: {port: 9003, service: readiness}
+          initialDelaySeconds: 10
+          periodSeconds: 2
+          failureThreshold: 3
+        resources:
+          requests: {cpu: "2", memory: 2Gi}
+          limits:   {memory: 8Gi}
+        volumeMounts:
+        - {name: config, mountPath: /config}
+      volumes:
+      - name: config
+        configMap:
+          name: kvepp-epp
+---
+# For the InferencePool's endpointPickerRef. Envoy does not use it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kvepp-epp
+  labels:
+    app.kubernetes.io/part-of: kvepp
+spec:
+  selector:
+    app.kubernetes.io/name: kvepp-epp
+  ports:
+  - {name: grpc-ext-proc, port: 9002}
+---
+# What Envoy resolves: one A record per Ready EPP pod.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kvepp-epp-headless
+  labels:
+    app.kubernetes.io/part-of: kvepp
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: kvepp-epp
+  ports:
+  - {name: grpc-ext-proc, port: 9002}

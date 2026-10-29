@@ -1,0 +1,28 @@
+# Version v0 of pdroll: --max-num-seqs 64. Deployed first.
+#
+#   kubectl apply -n $NS -k manifests/v0
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../base
+
+patches:
+  - target:
+      kind: DisaggregatedSet
+      name: pdroll
+    patch: |-
+      # roles/0 is prefill, roles/1 is decode.
+      - {op: test, path: /spec/roles/0/name, value: prefill}
+      - {op: test, path: /spec/roles/1/name, value: decode}
+      - {op: test, path: /spec/roles/0/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/env/0/name, value: ROLLOUT_VERSION}
+      - {op: test, path: /spec/roles/0/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/env/1/name, value: MAX_NUM_SEQS}
+      - {op: test, path: /spec/roles/1/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/env/0/name, value: ROLLOUT_VERSION}
+      - {op: test, path: /spec/roles/1/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/env/1/name, value: MAX_NUM_SEQS}
+
+      - {op: replace, path: /spec/roles/0/spec/leaderWorkerTemplate/workerTemplate/metadata/labels/rollout.example~1version, value: v0}
+      - {op: replace, path: /spec/roles/1/spec/leaderWorkerTemplate/workerTemplate/metadata/labels/rollout.example~1version, value: v0}
+      - {op: replace, path: /spec/roles/0/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/env/0/value, value: v0}
+      - {op: replace, path: /spec/roles/1/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/env/0/value, value: v0}
+      - {op: replace, path: /spec/roles/0/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/env/1/value, value: "64"}
+      - {op: replace, path: /spec/roles/1/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/env/1/value, value: "64"}

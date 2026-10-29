@@ -1,0 +1,216 @@
+# Envoy config for proxy.yaml. The llm-d router chart's standalone proxy (v1.0.0), with the
+# ext_proc cluster set up for several active EPP pods (health checks, panic threshold) and an
+# x-upstream-host response header naming the vLLM pod that served the request.
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 19000
+static_resources:
+  listeners:
+    - name: envoy-proxy-ready-0.0.0.0-19001
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 19001
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: envoy-ready-http
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: prometheus_stats
+                      domains: ["*"]
+                      routes:
+                        - match:
+                            prefix: "/stats/prometheus"
+                          route:
+                            cluster: "prometheus_stats"
+                http_filters:
+                  - name: envoy.filters.http.health_check
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.health_check.v3.HealthCheck
+                      pass_through_mode: false
+                      headers:
+                        - name: ":path"
+                          string_match:
+                            exact: "/ready"
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+    - name: vllm
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 8081
+      per_connection_buffer_limit_bytes: 32768
+      filter_chains:
+        - name: vllm
+          filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: http-8081
+                # Only the EPP may set the destination header (as in the rc.1 chart).
+                early_header_mutation_extensions:
+                  - name: envoy.http.early_header_mutation.header_mutation
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.http.early_header_mutation.header_mutation.v3.HeaderMutation
+                      mutations:
+                        - remove: x-gateway-destination-endpoint
+                route_config:
+                  name: vllm
+                  virtual_hosts:
+                    - name: vllm-default
+                      domains: ["*"]
+                      routes:
+                        - match:
+                            prefix: "/"
+                          # The vLLM pod the EPP picked, for loadgen.py to check prefix affinity.
+                          response_headers_to_add:
+                            - header: {key: x-upstream-host, value: "%UPSTREAM_HOST%"}
+                          route:
+                            cluster: original_destination_cluster
+                            timeout: 86400s
+                            idle_timeout: 86400s
+                            upgrade_configs:
+                              - upgrade_type: websocket
+                          typed_per_filter_config:
+                            envoy.filters.http.ext_proc:
+                              "@type": type.googleapis.com/envoy.config.route.v3.FilterConfig
+                              config: {}
+                http_filters:
+                  - name: envoy.filters.http.ext_proc
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+                      # Without a healthy EPP, fail the request rather than forward it unrouted.
+                      failure_mode_allow: false
+                      grpc_service:
+                        envoy_grpc:
+                          cluster_name: ext_proc
+                          authority: kvepp-epp-headless:9002
+                        timeout: 10s
+                      processing_mode:
+                        request_header_mode: SEND
+                        response_header_mode: SEND
+                        request_body_mode: FULL_DUPLEX_STREAMED
+                        response_body_mode: FULL_DUPLEX_STREAMED
+                        request_trailer_mode: SEND
+                        response_trailer_mode: SEND
+                      message_timeout: 1000s
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                      suppress_envoy_headers: true
+                http2_protocol_options:
+                  max_concurrent_streams: 100
+                  initial_stream_window_size: 65536
+                  initial_connection_window_size: 1048576
+                use_remote_address: true
+                normalize_path: true
+                merge_slashes: true
+                server_header_transformation: PASS_THROUGH
+                common_http_protocol_options:
+                  headers_with_underscores_action: REJECT_REQUEST
+                path_with_escaped_slashes_action: UNESCAPE_AND_REDIRECT
+  clusters:
+    - name: prometheus_stats
+      type: STATIC
+      connect_timeout: 0.250s
+      load_assignment:
+        cluster_name: prometheus_stats
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 19000
+    - name: original_destination_cluster
+      type: ORIGINAL_DST
+      connect_timeout: 1000s
+      lb_policy: CLUSTER_PROVIDED
+      circuit_breakers:
+        thresholds:
+          - max_connections: 40000
+            max_pending_requests: 40000
+            max_requests: 40000
+      original_dst_lb_config:
+        use_http_header: true
+        http_header_name: x-gateway-destination-endpoint
+      # vLLM closes connections idle for 5 s. Close them first, or a request sent on one as vLLM
+      # closes it fails with a 503 "connection termination".
+      common_http_protocol_options:
+        idle_timeout: 4s
+    # Every Ready EPP pod, through the headless Service (short name: resolved with the pod's
+    # search domains, so the namespace is not written here). Without leader election every
+    # synced, non-draining EPP passes the ext_proc health check, so requests round-robin over
+    # all of them. A draining EPP fails it and stops getting new requests within 4 s.
+    - name: ext_proc
+      type: STRICT_DNS
+      # Envoy before 1.40 reports an A lookup that times out after an empty AAAA lookup as an
+      # empty result and drops the EPP hosts (envoyproxy/envoy#47494). IPv4 only: a timeout stays
+      # a failure and the hosts are kept. The cluster network is IPv4.
+      # Keep this on 1.40+ too: AAAA never returns records here, so it only halves DNS lookups.
+      dns_lookup_family: V4_ONLY
+      ignore_health_on_host_removal: true
+      connect_timeout: 86400s
+      # Panic (spread over every host, healthy or not) only when no host is healthy. The default
+      # (50%) would also send requests to a draining EPP while two of three hosts are healthy.
+      common_lb_config:
+        healthy_panic_threshold:
+          value: 1
+      circuit_breakers:
+        thresholds:
+          - max_connections: 40000
+            max_pending_requests: 40000
+            max_requests: 40000
+            max_retries: 1024
+      health_checks:
+        - timeout: 2s
+          interval: 2s
+          no_traffic_interval: 2s
+          unhealthy_threshold: 2
+          healthy_threshold: 1
+          reuse_connection: true
+          grpc_health_check:
+            service_name: "envoy.service.ext_proc.v3.ExternalProcessor"
+          transport_socket_match_criteria:
+            health_plaintext: true
+      transport_socket_matches:
+        - name: health_plaintext
+          match:
+            health_plaintext: true
+          transport_socket:
+            name: envoy.transport_sockets.raw_buffer
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.raw_buffer.v3.RawBuffer
+      transport_socket:
+        name: "envoy.transport_sockets.tls"
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          common_tls_context:
+            validation_context:
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options:
+              initial_stream_window_size: 65536
+              initial_connection_window_size: 1048576
+      load_assignment:
+        cluster_name: ext_proc
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  # Health-check the EPP's health port (9003, plaintext): only it reports
+                  # draining. Port 9002 has no health service.
+                  health_check_config:
+                    port_value: 9003
+                  address:
+                    socket_address:
+                      address: kvepp-epp-headless
+                      port_value: 9002

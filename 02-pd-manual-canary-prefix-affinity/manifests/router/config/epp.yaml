@@ -1,0 +1,68 @@
+# EPP plugin config: P/D over every pod of every version, with the rollout screener keeping each
+# request -- and, with prefix affinity, each session -- inside one revision.
+#
+# The screener runs once per request, before both scheduling profiles. It picks one revision,
+# weighted by Ready pods, and hides every other revision's endpoints from the prefill and the
+# decode profile alike, so p0 only ever pairs with d0 and p1 with d1. It does not offer a
+# revision until it has a Ready pod of every required role.
+#
+# affinity.mode: prefix (llm-d/llm-d-router#3456) replaces the screener's random draw with a hash
+# of the conversation up to its first user message. Every turn of a session repeats that prefix,
+# so every turn draws the same number and lands on the same revision -- where its KV cache is --
+# instead of alternating between revisions in proportion to their shares and recomputing its
+# prefix on each switch. When the shares change, only the sessions whose draw falls between the
+# old and new boundary move, and always to the revision that gained share.
+#
+# rollout.sh writes AFFINITY (prefix; the control router gets none).
+apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- type: disaggregatedset-rollout-screener
+  parameters:
+    scope:
+      # Not disaggregatedset.x-k8s.io/name: the two versions are two DisaggregatedSet objects,
+      # and the screener has to see both.
+      labelSelector: "llm-d.ai/guide=pdcanary"
+    revisionGating:
+      # A revision's share = its share of Ready pods of the globally most numerous role.
+      # 2P2D vs 1P1D => 67% / 33%.
+      mode: max-role
+      requiredRoles: [prefill, decode]
+      # One EPP, sequential P/D: nothing to coordinate across.
+      disableCoordination: true
+      affinity:
+        mode: __AFFINITY__
+- type: always-disagg-pd-decider
+- type: disagg-profile-handler
+  parameters:
+    deciders:
+      prefill: always-disagg-pd-decider
+- type: prefill-filter
+- type: decode-filter
+# Within the chosen revision: send a session back to the prefill and decode pods that already
+# hold its prefix. The approximate producer remembers which pod it sent each prefix to.
+- type: approx-prefix-cache-producer
+  name: prefix-cache-producer
+- type: prefix-cache-scorer
+  parameters:
+    prefixMatchInfoProducerName: prefix-cache-producer
+- type: queue-scorer
+- type: active-request-scorer
+- type: max-score-picker
+schedulingProfiles:
+- name: prefill
+  plugins:
+  - pluginRef: prefill-filter
+  - pluginRef: prefix-cache-scorer
+    weight: 3
+  - pluginRef: queue-scorer
+    weight: 1
+  - pluginRef: max-score-picker
+- name: decode
+  plugins:
+  - pluginRef: decode-filter
+  - pluginRef: prefix-cache-scorer
+    weight: 3
+  - pluginRef: active-request-scorer
+    weight: 1
+  - pluginRef: max-score-picker

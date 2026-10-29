@@ -1,0 +1,18 @@
+# Every pod of both revisions: the screener, not the pool, keeps a request inside one revision.
+apiVersion: inference.networking.k8s.io/v1
+kind: InferencePool
+metadata:
+  name: pdroll
+spec:
+  appProtocol: http
+  selector:
+    matchLabels:
+      llm-d.ai/guide: pdroll
+  targetPorts:
+    - number: 8000
+  endpointPickerRef:
+    group: ""
+    kind: Service
+    name: pdroll-router-epp
+    port:
+      number: 9002

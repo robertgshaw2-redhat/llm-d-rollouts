@@ -1,0 +1,47 @@
+# Shared in-flight state for the two EPP replicas (the redis-syncer plugin in config/epp.yaml).
+# Holds only seconds-lived counters: no persistence, no password. When it is unreachable each EPP
+# falls back to its own counts.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kvepp-redis
+  labels:
+    app.kubernetes.io/name: kvepp-redis
+    app.kubernetes.io/part-of: kvepp
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kvepp-redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kvepp-redis
+        app.kubernetes.io/part-of: kvepp
+    spec:
+      containers:
+      - name: redis
+        image: docker.io/library/redis@sha256:a9cc41d6d01da2aa26c219e4f99ecbeead955a7b656c1c499cce8922311b2514 # 7.4.6
+        args: [--save, "", --appendonly, "no", --protected-mode, "no", --maxmemory, 256mb, --maxmemory-policy, noeviction]
+        ports:
+        - {name: redis, containerPort: 6379}
+        readinessProbe:
+          tcpSocket: {port: 6379}
+          periodSeconds: 5
+        resources:
+          requests: {cpu: 500m, memory: 128Mi}
+          limits:   {cpu: "2", memory: 384Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kvepp-redis
+  labels:
+    app.kubernetes.io/part-of: kvepp
+spec:
+  selector:
+    app.kubernetes.io/name: kvepp-redis
+  ports:
+  - {name: redis, port: 6379}

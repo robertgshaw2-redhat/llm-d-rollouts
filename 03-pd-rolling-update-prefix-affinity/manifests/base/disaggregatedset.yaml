@@ -1,0 +1,253 @@
+# The DeepSeek-V2-Lite-Chat P/D stack: 2 prefill + 2 decode, one DisaggregatedSet. The v0/ and
+# v1/ overlays are two versions of the same object; applying v1 over v0 changes the pod template,
+# and the controller rolls it out by itself (rolloutStrategy below), keeping the two roles'
+# progress in step.
+#
+# Every replica is one pod with 1 H200 (TP=1). Decode pods run the llm-d routing sidecar on
+# 8000 in front of vLLM on 8200: it runs the prompt on the prefill pod the EPP chose, then has
+# the local vLLM pull the KV cache from it over NIXL.
+#
+# What the router keys on:
+#   disaggregatedset.x-k8s.io/name       stamped by the controller; the rollout screener's scope
+#   disaggregatedset.x-k8s.io/revision   stamped by the controller, one per pod template; the
+#                                        screener never pairs a prefill and a decode across it
+#   llm-d.ai/guide: pdroll               the InferencePool selector
+#
+# Draining:
+#   preStop sleep       the pod is already out of the pool; keeps vLLM fully up while the EPP's
+#                       view converges and decodes finish pulling KV from a stopping prefill
+#   --shutdown-timeout  on SIGTERM, finish in-flight requests instead of aborting them
+#   terminationGracePeriodSeconds > preStop + shutdown-timeout
+apiVersion: disaggregatedset.x-k8s.io/v1
+kind: DisaggregatedSet
+metadata:
+  name: pdroll
+  labels:
+    llm-d.ai/guide: pdroll
+spec:
+  roles:
+    # ------------------------------------------------------------- prefill
+    - name: prefill
+      spec:
+        replicas: 2
+        startupPolicy: LeaderCreated
+        # Surge one new group of this role before removing an old one: capacity never drops
+        # during the roll. The controller interleaves the two roles' steps.
+        rolloutStrategy:
+          type: RollingUpdate
+          rollingUpdateConfiguration:
+            maxSurge: 1
+            maxUnavailable: 0
+        leaderWorkerTemplate:
+          size: 1
+          restartPolicy: RecreateGroupOnPodRestart
+          workerTemplate:
+            metadata:
+              labels:
+                llm-d.ai/guide: pdroll
+                llm-d.ai/role: prefill
+                llm-d.ai/inference-serving: "true"
+                rollout.example/version: REPLACE_VERSION
+            spec:
+              terminationGracePeriodSeconds: 150
+              tolerations:
+                - key: is_gpu
+                  operator: Exists
+                  effect: PreferNoSchedule
+              containers:
+                - name: vllm
+                  image: docker.io/vllm/vllm-openai@sha256:dea7fa047caa114167efccdeb42321b12d2c11da1add8728aa2662cb8d6b8cd5 # nightly 2026-09-18
+                  imagePullPolicy: IfNotPresent
+                  securityContext:
+                    capabilities:
+                      add: [IPC_LOCK, SYS_RAWIO]
+                    runAsGroup: 0
+                    runAsUser: 0
+                  command: ["/bin/bash", "-c"]
+                  args:
+                    - |-
+                      set -euo pipefail
+                      echo "rollout version: ${ROLLOUT_VERSION}"
+                      python3 -c "import nixl" 2>/dev/null || uv pip install --system nixl nixl-cu13
+                      exec vllm serve "${MODEL}" \
+                        --port 8000 \
+                        --served-model-name "${MODEL}" \
+                        --trust-remote-code \
+                        --disable-access-log-for-endpoints=/health,/metrics,/v1/models \
+                        --max-model-len 16384 \
+                        --max-num-seqs "${MAX_NUM_SEQS}" \
+                        --gpu-memory-utilization 0.6 \
+                        --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_load_failure_policy":"fail"}' \
+                        --shutdown-timeout "${SHUTDOWN_TIMEOUT}"
+                  env: &env
+                    # The version-specific knobs come first: the overlays patch them by index
+                    # (guarded by `op: test`).
+                    - name: ROLLOUT_VERSION
+                      value: REPLACE_VERSION
+                    - name: MAX_NUM_SEQS
+                      value: "64"
+                    - name: MODEL
+                      value: deepseek-ai/DeepSeek-V2-Lite-Chat
+                    - name: SHUTDOWN_TIMEOUT
+                      value: "90"
+                    - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: status.podIP
+                    - name: HF_TOKEN
+                      valueFrom:
+                        secretKeyRef:
+                          name: llm-d-hf-token
+                          key: HF_TOKEN
+                    - name: HF_HUB_CACHE
+                      value: /var/cache/huggingface
+                    - name: VLLM_CACHE_ROOT
+                      value: /var/cache/vllm/vllm
+                    - name: FLASHINFER_WORKSPACE_BASE
+                      value: /var/cache/vllm/flashinfer
+                    - name: CUDA_CACHE_PATH
+                      value: /var/cache/vllm/cuda
+                    - name: VLLM_HTTP_TIMEOUT_KEEP_ALIVE
+                      value: "120"
+                    - name: NCCL_IB_HCA
+                      value: ibp
+                  ports:
+                    - {name: http, containerPort: 8000, protocol: TCP}
+                  lifecycle: &lifecycle
+                    preStop:
+                      sleep:
+                        seconds: 20
+                  resources: &resources
+                    requests:
+                      cpu: "8"
+                      memory: 64Gi
+                      nvidia.com/gpu: "1"
+                      rdma/ib: "1"
+                    limits:
+                      memory: 64Gi
+                      nvidia.com/gpu: "1"
+                      rdma/ib: "1"
+                  startupProbe:
+                    httpGet: {path: /health, port: 8000}
+                    periodSeconds: 2
+                    timeoutSeconds: 5
+                    failureThreshold: 1350
+                  readinessProbe:
+                    httpGet: {path: /health, port: 8000}
+                    periodSeconds: 5
+                    timeoutSeconds: 5
+                    failureThreshold: 3
+                  livenessProbe:
+                    httpGet: {path: /health, port: 8000}
+                    periodSeconds: 30
+                    timeoutSeconds: 5
+                    failureThreshold: 3
+                  volumeMounts: &mounts
+                    - {name: dshm, mountPath: /dev/shm}
+                    - {name: hf-cache, mountPath: /var/cache/huggingface}
+                    - {name: jit-cache, mountPath: /var/cache/vllm}
+              volumes: &volumes
+                - name: dshm
+                  emptyDir: {medium: Memory, sizeLimit: 8Gi}
+                # CoreWeave node-local NVMe: weights and JIT kernels are paid for once per node.
+                - name: hf-cache
+                  hostPath: {path: /mnt/local/hf-cache, type: DirectoryOrCreate}
+                - name: jit-cache
+                  hostPath: {path: /mnt/local/jit-cache, type: DirectoryOrCreate}
+
+    # -------------------------------------------------------------- decode
+    - name: decode
+      spec:
+        replicas: 2
+        startupPolicy: LeaderCreated
+        # Surge one new group of this role before removing an old one: capacity never drops
+        # during the roll. The controller interleaves the two roles' steps.
+        rolloutStrategy:
+          type: RollingUpdate
+          rollingUpdateConfiguration:
+            maxSurge: 1
+            maxUnavailable: 0
+        leaderWorkerTemplate:
+          size: 1
+          restartPolicy: RecreateGroupOnPodRestart
+          workerTemplate:
+            metadata:
+              labels:
+                llm-d.ai/guide: pdroll
+                llm-d.ai/role: decode
+                llm-d.ai/inference-serving: "true"
+                rollout.example/version: REPLACE_VERSION
+            spec:
+              terminationGracePeriodSeconds: 150
+              tolerations:
+                - key: is_gpu
+                  operator: Exists
+                  effect: PreferNoSchedule
+              # Native sidecar: owns 8000 (what the pool routes to), runs the prompt on the
+              # EPP-chosen prefill pod, then hands off to the local vLLM on 8200. As a native
+              # sidecar it outlives the vllm container on termination, so draining requests keep
+              # their proxy.
+              initContainers:
+                - name: routing-proxy
+                  image: ghcr.io/llm-d/llm-d-router-disagg-sidecar@sha256:83cdf20199485329baca89b69d78f695735855ed93412aeaeec325d2374ced04 # v1.0.0
+                  imagePullPolicy: IfNotPresent
+                  restartPolicy: Always
+                  args:
+                    - --port=8000
+                    - --model-server-port=8200
+                    - --kv-connector=nixlv2
+                    - --secure-serving=false
+                    - --zap-log-level=2
+                  ports:
+                    - {name: http, containerPort: 8000, protocol: TCP}
+                  resources: {}
+                  securityContext:
+                    allowPrivilegeEscalation: false
+                    runAsNonRoot: true
+              containers:
+                - name: vllm
+                  image: docker.io/vllm/vllm-openai@sha256:dea7fa047caa114167efccdeb42321b12d2c11da1add8728aa2662cb8d6b8cd5 # nightly 2026-09-18
+                  imagePullPolicy: IfNotPresent
+                  securityContext:
+                    capabilities:
+                      add: [IPC_LOCK, SYS_RAWIO]
+                    runAsGroup: 0
+                    runAsUser: 0
+                  command: ["/bin/bash", "-c"]
+                  args:
+                    - |-
+                      set -euo pipefail
+                      echo "rollout version: ${ROLLOUT_VERSION}"
+                      python3 -c "import nixl" 2>/dev/null || uv pip install --system nixl nixl-cu13
+                      exec vllm serve "${MODEL}" \
+                        --port 8200 \
+                        --served-model-name "${MODEL}" \
+                        --trust-remote-code \
+                        --disable-access-log-for-endpoints=/health,/metrics,/v1/models \
+                        --max-model-len 16384 \
+                        --max-num-seqs "${MAX_NUM_SEQS}" \
+                        --gpu-memory-utilization 0.6 \
+                        --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_load_failure_policy":"fail"}' \
+                        --shutdown-timeout "${SHUTDOWN_TIMEOUT}"
+                  env: *env
+                  ports:
+                    - {name: vllm, containerPort: 8200, protocol: TCP}
+                  lifecycle: *lifecycle
+                  resources: *resources
+                  startupProbe:
+                    httpGet: {path: /health, port: 8200}
+                    periodSeconds: 2
+                    timeoutSeconds: 5
+                    failureThreshold: 1350
+                  readinessProbe:
+                    httpGet: {path: /health, port: 8200}
+                    periodSeconds: 5
+                    timeoutSeconds: 5
+                    failureThreshold: 3
+                  livenessProbe:
+                    httpGet: {path: /health, port: 8200}
+                    periodSeconds: 30
+                    timeoutSeconds: 5
+                    failureThreshold: 3
+                  volumeMounts: *mounts
+              volumes: *volumes

@@ -1,0 +1,16 @@
+# The router objects with __ROUTER__ / __AFFINITY__ placeholders, which rollout.sh fills in.
+# The InferencePool is applied once, separately (pool.yaml): both routers read the same pool.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - router.yaml
+
+generatorOptions:
+  disableNameSuffixHash: true
+
+configMapGenerator:
+  - name: __ROUTER__-epp
+    files: [config/epp.yaml]
+  - name: __ROUTER__-envoy
+    files: [config/envoy.yaml]

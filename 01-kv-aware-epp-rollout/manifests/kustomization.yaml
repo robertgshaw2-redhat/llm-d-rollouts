@@ -1,0 +1,29 @@
+# Everything except the namespace: rollout.sh applies it with -n "$NS" and writes the namespace
+# into the EPP config's pod discovery.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - vllm.yaml
+  - redis.yaml
+  - epp.yaml
+  - proxy.yaml
+
+generatorOptions:
+  # Fixed names: rollout.sh swaps the EPP config in place (roll nosnap) and restarts the EPP.
+  disableNameSuffixHash: true
+  labels:
+    app.kubernetes.io/part-of: kvepp
+
+configMapGenerator:
+  - name: kvepp-epp
+    files: [config/epp.yaml]
+  - name: kvepp-envoy
+    files: [config/envoy.yaml]
+  # vllm-project/vllm#57789 at 4319361e (vMaroon/vllm codex/kv-event-snapshots): the three files
+  # the PR changes, copied over the nightly's at vLLM start (vllm.yaml).
+  - name: kvepp-vllm-kv-snapshots
+    files:
+      - vllm-kv-snapshots/config_kv_events.py
+      - vllm-kv-snapshots/distributed_kv_events.py
+      - vllm-kv-snapshots/distributed_kv_events_snapshot.py

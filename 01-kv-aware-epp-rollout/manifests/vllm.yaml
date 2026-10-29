@@ -1,0 +1,173 @@
+# The model servers: 4 aggregated vLLM pods, 1 H200 each, DeepSeek-V2-Lite-Chat. They are not
+# rolled in this example; they are what the routers keep a KV-cache index of.
+#
+# Every pod publishes its KV-cache events (ZMQ PUB on 5557) and serves snapshots of its current
+# cache state (ZMQ ROUTER on 6557). A router that starts late -- every new EPP pod in a rollout --
+# loads each pod's snapshot, then follows the live stream with no gap, so it knows which pod
+# holds which prefix from the moment it starts routing.
+#
+# Snapshots are vllm-project/vllm#57789 (branch vMaroon/vllm codex/kv-event-snapshots), not yet
+# in a vLLM release or nightly. The PR changes three Python files and nothing else in the
+# package, so this runs the nightly the PR is based on and copies the PR's versions of those
+# files over it before vLLM starts (vllm-kv-snapshots/, mounted from a ConfigMap).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kvepp-vllm
+  labels:
+    app.kubernetes.io/name: kvepp-vllm
+    app.kubernetes.io/part-of: kvepp
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kvepp-vllm
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kvepp-vllm
+        app.kubernetes.io/part-of: kvepp
+        # The InferencePool and the EPP's KV-event pod discovery both select on this.
+        llm-d.ai/guide: kvepp
+    spec:
+      terminationGracePeriodSeconds: 150
+      tolerations:
+        - key: is_gpu
+          operator: Exists
+          effect: PreferNoSchedule
+      containers:
+        - name: vllm
+          # vllm/vllm-openai:nightly-5d35ce3934a7804b298559d2d99eec33792e1eb9 (2026-10-27). It contains
+          # 41f5146b, the main commit #57789 is based on, and has the same three files as 41f5146b.
+          image: docker.io/vllm/vllm-openai@sha256:3431ebee919296f7a5f3604db353f639e1474a4c7ef37595e31de6699fd831a7
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+            - |-
+              set -euo pipefail
+              # vllm-project/vllm#57789 at 4319361e: KV-event snapshots.
+              pkg=$(python3 -c 'import importlib.util; print(importlib.util.find_spec("vllm").submodule_search_locations[0])')
+              cp /opt/vllm-kv-snapshots/config_kv_events.py              "$pkg/config/kv_events.py"
+              cp /opt/vllm-kv-snapshots/distributed_kv_events.py         "$pkg/distributed/kv_events.py"
+              cp /opt/vllm-kv-snapshots/distributed_kv_events_snapshot.py "$pkg/distributed/kv_events_snapshot.py"
+
+              # --block-size 64: the EPP hashes prompts in 64-token blocks (blockSizeTokens).
+              # --enable-scale-out: /v1/*/render, which the EPP's token-producer tokenizes with.
+              # --enable-prompt-tokens-details: usage.prompt_tokens_details.cached_tokens, which
+              #   loadgen.py reads to tell a prefix-cache hit from a miss.
+              # The topic names the pod the way the pool does (ip:port), so the index and the
+              # scheduler agree on which endpoint holds a block.
+              exec vllm serve "${MODEL}" \
+                --port 8000 \
+                --served-model-name "${MODEL}" \
+                --trust-remote-code \
+                --disable-access-log-for-endpoints=/health,/metrics,/v1/models \
+                --max-model-len 16384 \
+                --gpu-memory-utilization 0.85 \
+                --block-size 64 \
+                --enable-scale-out \
+                --enable-prompt-tokens-details \
+                --kv-events-config "{\"enable_kv_cache_events\":true,\"publisher\":\"zmq\",\"endpoint\":\"tcp://*:5557\",\"snapshot_endpoint\":\"tcp://*:6557\",\"topic\":\"kv@${POD_IP}:8000@${MODEL}\"}" \
+                --shutdown-timeout 90
+          env:
+            - name: MODEL
+              value: deepseek-ai/DeepSeek-V2-Lite-Chat
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: llm-d-hf-token
+                  key: HF_TOKEN
+            - name: HF_HUB_CACHE
+              value: /var/cache/huggingface
+            - name: VLLM_CACHE_ROOT
+              value: /var/cache/vllm/vllm
+            - name: FLASHINFER_WORKSPACE_BASE
+              value: /var/cache/vllm/flashinfer
+            - name: CUDA_CACHE_PATH
+              value: /var/cache/vllm/cuda
+            # Longer than Envoy's 4 s upstream idle timeout, so Envoy always closes an idle
+            # connection first and never sends a request on one vLLM is closing.
+            - name: VLLM_HTTP_TIMEOUT_KEEP_ALIVE
+              value: "120"
+            - name: DO_NOT_TRACK
+              value: "1"
+          ports:
+            - {name: http, containerPort: 8000, protocol: TCP}
+            - {name: kv-events, containerPort: 5557, protocol: TCP}
+            - {name: kv-snapshot, containerPort: 6557, protocol: TCP}
+          resources:
+            requests:
+              cpu: "8"
+              memory: 64Gi
+              nvidia.com/gpu: "1"
+            limits:
+              memory: 64Gi
+              nvidia.com/gpu: "1"
+          startupProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 360
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - {name: dshm, mountPath: /dev/shm}
+            - {name: hf-cache, mountPath: /var/cache/huggingface}
+            - {name: jit-cache, mountPath: /var/cache/vllm}
+            - {name: kv-snapshots, mountPath: /opt/vllm-kv-snapshots, readOnly: true}
+      volumes:
+        - name: dshm
+          emptyDir: {medium: Memory, sizeLimit: 8Gi}
+        # CoreWeave node-local NVMe: weights and JIT kernels are paid for once per node.
+        - name: hf-cache
+          hostPath: {path: /mnt/local/hf-cache, type: DirectoryOrCreate}
+        - name: jit-cache
+          hostPath: {path: /mnt/local/jit-cache, type: DirectoryOrCreate}
+        - name: kv-snapshots
+          configMap:
+            name: kvepp-vllm-kv-snapshots
+---
+# For the EPP's token-producer: any pod can render (tokenize) a request.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kvepp-vllm
+  labels:
+    app.kubernetes.io/part-of: kvepp
+spec:
+  selector:
+    app.kubernetes.io/name: kvepp-vllm
+  ports:
+    - {name: http, port: 8000, targetPort: http}
+---
+apiVersion: inference.networking.k8s.io/v1
+kind: InferencePool
+metadata:
+  name: kvepp
+  labels:
+    app.kubernetes.io/part-of: kvepp
+spec:
+  appProtocol: http
+  selector:
+    matchLabels:
+      llm-d.ai/guide: kvepp
+  targetPorts:
+    - number: 8000
+  endpointPickerRef:
+    group: ""
+    kind: Service
+    name: kvepp-epp
+    port:
+      number: 9002

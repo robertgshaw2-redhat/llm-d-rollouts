@@ -1,0 +1,36 @@
+# Incumbent: p0/d0, admitted at 2 prefill + 2 decode, --max-num-seqs 64.
+#
+#   kubectl apply -n $NS -k manifests/v0
+#
+# The replica counts below are only the *admission* shape. After that the rollout is driven by
+# patching spec.roles[].spec.replicas (rollout.sh scale); re-applying this overlay resets them.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+nameSuffix: -v0
+
+resources:
+  - ../base
+
+patches:
+  - target:
+      kind: DisaggregatedSet
+      name: pdcanary
+    patch: |-
+      # roles/0 is prefill, roles/1 is decode.
+      - {op: test, path: /spec/roles/0/name, value: prefill}
+      - {op: test, path: /spec/roles/1/name, value: decode}
+      - {op: test, path: /spec/roles/0/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/env/0/name, value: ROLLOUT_VERSION}
+      - {op: test, path: /spec/roles/0/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/env/1/name, value: MAX_NUM_SEQS}
+      - {op: test, path: /spec/roles/1/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/env/0/name, value: ROLLOUT_VERSION}
+      - {op: test, path: /spec/roles/1/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/env/1/name, value: MAX_NUM_SEQS}
+
+      - {op: replace, path: /spec/roles/0/spec/replicas, value: 2}
+      - {op: replace, path: /spec/roles/1/spec/replicas, value: 2}
+
+      - {op: replace, path: /spec/roles/0/spec/leaderWorkerTemplate/workerTemplate/metadata/labels/rollout.example~1version, value: v0}
+      - {op: replace, path: /spec/roles/1/spec/leaderWorkerTemplate/workerTemplate/metadata/labels/rollout.example~1version, value: v0}
+      - {op: replace, path: /spec/roles/0/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/env/0/value, value: v0}
+      - {op: replace, path: /spec/roles/1/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/env/0/value, value: v0}
+      - {op: replace, path: /spec/roles/0/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/env/1/value, value: "64"}
+      - {op: replace, path: /spec/roles/1/spec/leaderWorkerTemplate/workerTemplate/spec/containers/0/env/1/value, value: "64"}

@@ -1,0 +1,91 @@
+# EPP plugin config, loaded by both EPP replicas (epp.yaml). Precise prefix-cache routing as
+# production DeepSeek-V4.1-Flash runs it, plus Redis cross-replica sync so two active routers see
+# each other's in-flight load.
+#
+# What makes the rollout KV-aware is one line: snapshotSocketPort. A new EPP pod dials every vLLM
+# pod's snapshot socket as soon as it discovers the pod, loads the pod's current cache state, and
+# then follows the live event stream. Without it, a new pod only learns about blocks stored after
+# it started, and routes every older prefix as a miss (rollout.sh roll nosnap is that control).
+apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+# Tokenizes each request on a vLLM pod (/v1/chat/completions/render), so the prefix-cache index
+# is keyed on the same tokens vLLM hashes.
+- type: token-producer
+  parameters:
+    modelName: deepseek-ai/DeepSeek-V2-Lite-Chat
+    vllm:
+      url: http://kvepp-vllm:8000
+- type: endpoint-notification-source
+- type: precise-prefix-cache-producer
+  name: precise-prefix-cache-producer
+  parameters:
+    tokenProcessorConfig:
+      blockSizeTokens: 64          # = vLLM --block-size
+    speculativeIndexing: false
+    indexerConfig:
+      kvBlockIndexConfig:
+        enableMetrics: true
+        inMemoryConfig:
+          size: 10000000
+          podCacheSize: 1024
+    kvEventsConfig:
+      topicFilter: "kv@"
+      concurrency: 16
+      discoverPods: true
+      podDiscoveryConfig:
+        podNamespace: __NAMESPACE__ # rollout.sh fills it in; empty would watch every namespace
+        podLabelSelector: llm-d.ai/guide=kvepp
+        socketPort: 5557           # live events (vLLM kv-events endpoint)
+        snapshotSocketPort: 6557   # snapshots (vLLM snapshot_endpoint)
+# Active-active: each replica publishes its per-endpoint in-flight counts to Redis every 200 ms and
+# adds its peers' to its own, so the affinity filter and the load scorer see both routers' load.
+- type: redis-syncer
+  name: redis
+  parameters:
+    address: kvepp-redis:6379
+    stateTTL: 2s
+# Do not rename: token-load-scorer resolves its data key against the default name.
+- type: inflight-load-producer
+  name: inflight-load-producer
+  parameters:
+    addEstimatedOutputTokens: false
+    prefixMatchInfoProducerName: precise-prefix-cache-producer
+# Keeps only the pods holding at least half of the request's prefix, unless queueing there would
+# cost more TTFT than recomputing the prefix elsewhere.
+- type: prefix-cache-affinity-filter
+  name: prefix-cache-affinity-filter
+  parameters:
+    affinityThreshold: 0.5
+    explorationProbability: 0
+    inFlightLoadProducerName: inflight-load-producer
+    maxTTFTPenaltyMs: 10000
+    peakPrefillThroughput: 60000
+    prefixMatchInfoProducerName: precise-prefix-cache-producer
+- type: token-load-scorer
+- name: metrics-source
+  type: metrics-data-source
+  parameters:
+    scheme: http
+    families:
+    - vllm:num_requests_waiting
+    - vllm:num_requests_running
+    - vllm:kv_cache_usage_perc
+    - vllm:cache_config_info
+- name: metrics-extractor
+  type: core-metrics-extractor
+schedulingProfiles:
+- name: default
+  plugins:
+  - pluginRef: prefix-cache-affinity-filter
+  - pluginRef: token-load-scorer
+dataLayer:
+  injectDefaults: false
+  crossReplicaSyncerPluginRef: redis
+  sources:
+  - pluginRef: endpoint-notification-source
+    extractors:
+    - pluginRef: precise-prefix-cache-producer
+  - pluginRef: metrics-source
+    extractors:
+    - pluginRef: metrics-extractor

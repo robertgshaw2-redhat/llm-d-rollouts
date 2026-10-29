@@ -1,0 +1,161 @@
+# The router: one EPP and one Envoy in front of every pod of every version. rollout.sh renders
+# this twice: as pdcanary-router (prefix affinity; the client entrypoint, Service
+# pdcanary-router:80) and, for the control experiment, as pdcanary-control (affinity none) over
+# the same pods. __ROUTER__ is the name.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: __ROUTER__-epp
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: __ROUTER__-epp
+rules:
+- apiGroups: [""]
+  resources: [pods]
+  verbs: [get, watch, list]
+- apiGroups: [inference.networking.x-k8s.io, llm-d.ai]
+  resources: [inferenceobjectives, inferencemodelrewrites]
+  verbs: [get, watch, list]
+- apiGroups: [inference.networking.k8s.io]
+  resources: [inferencepools]
+  verbs: [get, watch, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: __ROUTER__-epp
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: __ROUTER__-epp}
+subjects:
+- {kind: ServiceAccount, name: __ROUTER__-epp}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: __ROUTER__-epp
+  labels:
+    app.kubernetes.io/name: __ROUTER__-epp
+spec:
+  # One replica: the revision draw is a pure function of the request and the Ready pod counts,
+  # but the approximate prefix index is local to the process.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: __ROUTER__-epp
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: __ROUTER__-epp
+    spec:
+      serviceAccountName: __ROUTER__-epp
+      terminationGracePeriodSeconds: 600
+      containers:
+      - name: epp
+        # llm-d-router v1.0.0 + backports (project-cb-lab/llm-d-router#4 at 68c5e10c), which carries
+        # llm-d/llm-d-router#3456 (revisionGating.affinity.mode: prefix). Not in an upstream
+        # release yet; see the README for how this image was built.
+        image: ghcr.io/robertgshaw2-redhat/llm-d-router-endpoint-picker@sha256:0264b2d620b83813392d000ae25da565808e4541696b758da81f6dc71b063889 # cb-v1.0.0-68c5e10, linux/amd64
+        imagePullPolicy: IfNotPresent
+        args:
+        - --pool-name
+        - pdcanary
+        - --config-file
+        - /config/epp.yaml
+        - --grpc-health-port
+        - "9003"
+        - --zap-encoder
+        - json
+        - --tracing=false
+        - --metrics-endpoint-auth=false
+        # disaggregatedset-rollout-screener is Alpha.
+        - --allow-experimental-plugins
+        - --drain-timeout=15s
+        env:
+        - {name: NAMESPACE, valueFrom: {fieldRef: {fieldPath: metadata.namespace}}}
+        - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+        ports:
+        - {name: grpc, containerPort: 9002}
+        - {name: grpc-health, containerPort: 9003}
+        - {name: metrics, containerPort: 9090}
+        livenessProbe:
+          grpc: {port: 9003, service: liveness}
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        # With revision gating on, the EPP is not Ready until it has seen every pod of the
+        # initial list, so it never serves on a partial view of the revisions.
+        readinessProbe:
+          grpc: {port: 9003, service: readiness}
+          periodSeconds: 2
+        resources:
+          requests: {cpu: "2", memory: 2Gi}
+          limits:   {memory: 8Gi}
+        volumeMounts:
+        - {name: config, mountPath: /config}
+      volumes:
+      - name: config
+        configMap:
+          name: __ROUTER__-epp
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: __ROUTER__-epp
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: __ROUTER__-epp
+  ports:
+  - {name: grpc-ext-proc, port: 9002}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: __ROUTER__-proxy
+  labels:
+    app.kubernetes.io/name: __ROUTER__-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: __ROUTER__-proxy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: __ROUTER__-proxy
+    spec:
+      terminationGracePeriodSeconds: 600
+      containers:
+      - name: envoy
+        image: docker.io/envoyproxy/envoy@sha256:447f857a01460642ef08ca2ab51136a44b9101fc2fa6bca2d1ae534466fa62f5 # v1.38.4
+        command: [/bin/sh, -c]
+        args:
+        - ulimit -n 524288 || ulimit -n $(ulimit -Hn); exec /usr/local/bin/envoy --service-node
+          envoy-proxy --log-level warn --concurrency 8 --drain-strategy immediate
+          --drain-time-s 60 -c /etc/envoy/envoy.yaml
+        ports:
+        - {name: http, containerPort: 8081}
+        - {name: ready, containerPort: 19001}
+        readinessProbe:
+          httpGet: {path: /ready, port: 19001}
+          periodSeconds: 5
+          failureThreshold: 1
+        resources:
+          requests: {cpu: "2", memory: 1Gi}
+          limits:   {memory: 4Gi}
+        volumeMounts:
+        - {name: config, mountPath: /etc/envoy, readOnly: true}
+      volumes:
+      - name: config
+        configMap:
+          name: __ROUTER__-envoy
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: __ROUTER__
+spec:
+  selector:
+    app.kubernetes.io/name: __ROUTER__-proxy
+  ports:
+  - {name: http, port: 80, targetPort: 8081}
